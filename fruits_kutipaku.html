@@ -1,0 +1,221 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>パクパク・キャッチ！</title>
+  <style>
+    body {
+      margin: 0;
+      background: #222;
+      color: #fff;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      overflow: hidden; /* スクロールバーを隠す */
+    }
+    .video-container {
+      position: relative;
+      width: 640px;
+      height: 480px;
+      background: #000;
+      border-radius: 8px;
+      overflow: hidden;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.8);
+    }
+    video, canvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      transform: scaleX(-1); /* 鏡合わせにする */
+    }
+    /* UIをカメラ映像の上に重ねる */
+    #ui-layer {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      z-index: 10;
+      pointer-events: none; /* クリックを邪魔しない */
+    }
+    #scoreDisplay {
+      font-size: 2.5rem;
+      font-weight: bold;
+      color: #FFD700;
+      text-shadow: 2px 2px 4px rgba(0,0,0,0.8);
+      margin-bottom: 8px;
+    }
+    #mouthStatus {
+      font-size: 1.5rem;
+      font-weight: bold;
+      text-shadow: 1px 1px 2px rgba(0,0,0,0.8);
+    }
+    #loading {
+      margin-bottom: 16px;
+      font-weight: bold;
+    }
+  </style>
+</head>
+<body>
+
+  <div id="loading">AIモデルを読み込み中...</div>
+  
+  <div class="video-container">
+    <video id="webcam" autoplay playsinline></video>
+    <canvas id="outputCanvas"></canvas>
+    
+    <!-- ゲーム用のUIレイヤー -->
+    <div id="ui-layer">
+      <div id="scoreDisplay">スコア: 0</div>
+      <div id="mouthStatus">😐 口は閉じています</div>
+    </div>
+  </div>
+
+  <script type="module">
+    import { FaceLandmarker, FilesetResolver, DrawingUtils } 
+      from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/+esm";
+
+    const video = document.getElementById("webcam");
+    const canvas = document.getElementById("outputCanvas");
+    const ctx = canvas.getContext("2d");
+    const loadingText = document.getElementById("loading");
+    const scoreDisplay = document.getElementById("scoreDisplay");
+    const mouthStatusText = document.getElementById("mouthStatus");
+
+    let faceLandmarker;
+    let lastVideoTime = -1;
+
+    // ゲーム用の変数
+    let score = 0;
+    let fallingFoods = [];
+    const foodEmojis = ["🍎", "🍩", "🍕", "🍔", "🍓"];
+
+    async function initMediaPipe() {
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+      );
+      
+      faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+          delegate: "GPU"
+        },
+        runningMode: "VIDEO",
+        numFaces: 1
+      });
+
+      loadingText.style.display = "none"; // ロード完了したら隠す
+      startCamera();
+    }
+
+    function startCamera() {
+      navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } })
+        .then((stream) => {
+          video.srcObject = stream;
+          video.addEventListener("loadeddata", predictWebcam);
+        })
+        .catch((err) => alert("カメラが使えません: " + err));
+    }
+
+    async function predictWebcam() {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const drawingUtils = new DrawingUtils(ctx);
+
+      if (lastVideoTime !== video.currentTime) {
+        lastVideoTime = video.currentTime;
+        const results = faceLandmarker.detectForVideo(video, performance.now());
+        
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        
+        let mouthX = -100;
+        let mouthY = -100;
+        let isMouthOpen = false;
+
+        // 顔が認識されている場合のみ座標を取得・描画
+        if (results.faceLandmarks && results.faceLandmarks.length > 0) {
+          const landmarks = results.faceLandmarks[0];
+          
+          // 目の輪郭を描画（緑）
+          drawingUtils.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE, { color: "#30FF30", lineWidth: 1 });
+          drawingUtils.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_LEFT_EYE, { color: "#30FF30", lineWidth: 1 });
+          
+          // --- 口の判定ロジック ---
+          const upperLip = landmarks[13]; // 上唇の内側
+          const lowerLip = landmarks[14]; // 下唇の内側
+          
+          // 画面上のX, Y座標（ピクセル）に変換
+          mouthX = (upperLip.x + lowerLip.x) / 2 * canvas.width;
+          mouthY = (upperLip.y + lowerLip.y) / 2 * canvas.height;
+          
+          // 口の開き具合を計算
+          const mouthDistance = Math.abs(upperLip.y - lowerLip.y) * canvas.height;
+          isMouthOpen = mouthDistance > 15;
+
+          if (isMouthOpen) {
+            mouthStatusText.innerText = "😮 パクッ！";
+            mouthStatusText.style.color = "#FF3030";
+          } else {
+            mouthStatusText.innerText = "😐 ...";
+            mouthStatusText.style.color = "#FFFFFF";
+          }
+        } else {
+          mouthStatusText.innerText = "顔が見えません";
+        }
+
+        // ==========================================
+        // ゲームロジック：食べ物の生成と落下
+        // ==========================================
+        
+        // 1. 約3%の確率で新しい食べ物を画面上部に生成
+        if (Math.random() < 0.03) {
+          fallingFoods.push({
+            x: Math.random() * canvas.width,
+            y: -30, // 画面の少し上からスタート
+            emoji: foodEmojis[Math.floor(Math.random() * foodEmojis.length)],
+            speed: 3 + Math.random() * 5 // 落ちる速度（ランダム）
+          });
+        }
+
+        // 絵文字を描画するためのCanvas設定
+        ctx.font = "40px Arial";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+
+        // 2. 食べ物を動かして、当たり判定を行う
+        for (let i = fallingFoods.length - 1; i >= 0; i--) {
+          let food = fallingFoods[i];
+          food.y += food.speed; // 下に移動
+
+          // 反転しているCanvasで文字を正常に描画するための処理
+          ctx.save();
+          ctx.scale(-1, 1);
+          ctx.fillText(food.emoji, -food.x, food.y);
+          ctx.restore();
+
+          // 3. 当たり判定（口との距離が50ピクセル以内 ＆ 口が開いているか）
+          const dist = Math.hypot(food.x - mouthX, food.y - mouthY);
+          
+          if (dist < 50 && isMouthOpen) {
+            // キャッチ成功！
+            score += 100;
+            scoreDisplay.innerText = "スコア: " + score;
+            fallingFoods.splice(i, 1); // 食べたので画面から消す
+          } 
+          else if (food.y > canvas.height + 50) {
+            // 画面の下に落ちてしまったら消す
+            fallingFoods.splice(i, 1);
+          }
+        }
+      }
+      
+      requestAnimationFrame(predictWebcam);
+    }
+
+    initMediaPipe();
+  </script>
+</body>
+</html>

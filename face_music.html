@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>顔面テルミン ＆ まばたきドラム（裏タブ対応版）</title>
+  <style>
+    body { margin: 0; background: #181818; color: #fff; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; font-family: sans-serif; overflow: hidden; }
+    .container { position: relative; width: 640px; height: 480px; border-radius: 12px; overflow: hidden; box-shadow: 0 8px 24px rgba(0,0,0,0.7); }
+    video, canvas { position: absolute; top: 0; left: 0; width: 100%; height: 100%; transform: scaleX(-1); }
+    #ui { position: absolute; top: 16px; left: 16px; z-index: 10; background: rgba(0,0,0,0.6); padding: 12px 20px; border-radius: 8px; pointer-events: none; }
+    .info { font-size: 1.1rem; margin-bottom: 4px; }
+    .drum-flash { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; z-index: 5; opacity: 0; transition: opacity 0.1s ease; }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    <video id="webcam" autoplay playsinline></video>
+    <canvas id="outputCanvas"></canvas>
+    <div id="flashLayer" class="drum-flash"></div>
+    <div id="ui">
+      <div class="info" id="pitchInfo">🎼 周波数: --- Hz</div>
+      <div class="info" id="volInfo">🔊 音量: 0%</div>
+      <div class="info" id="drumInfo">🥁 ドラム: 待機中</div>
+    </div>
+  </div>
+
+  <p style="margin-top: 12px; color: #aaa;">※ 画面をクリックして音声を有効化してください ※</p>
+
+  <script type="module">
+    import { FaceLandmarker, FilesetResolver, DrawingUtils } 
+      from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/+esm";
+
+    const video = document.getElementById("webcam");
+    const canvas = document.getElementById("outputCanvas");
+    const ctx = canvas.getContext("2d");
+    const flashLayer = document.getElementById("flashLayer");
+
+    let faceLandmarker;
+    let lastVideoTime = -1;
+
+    // ==========================================
+    // 1. Web Audio API（ブラウザ音源）の準備
+    // ==========================================
+    let audioCtx = null;
+    let thereminOsc = null;
+    let thereminGain = null;
+    let thereminFilter = null; // ★ フィルター
+
+    function initAudio() {
+      if (audioCtx) return;
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+
+      thereminOsc = audioCtx.createOscillator();
+      thereminGain = audioCtx.createGain();
+      thereminFilter = audioCtx.createBiquadFilter();
+
+      thereminOsc.type = 'sawtooth'; // ギザギザした波形（ノコギリ波）
+      thereminOsc.frequency.setValueAtTime(440, audioCtx.currentTime);
+      thereminGain.gain.setValueAtTime(0, audioCtx.currentTime);
+      
+      thereminFilter.type = 'lowpass';
+      thereminFilter.frequency.setValueAtTime(1000, audioCtx.currentTime); 
+
+      thereminOsc.connect(thereminFilter);
+      thereminFilter.connect(thereminGain);
+      thereminGain.connect(audioCtx.destination);
+      thereminOsc.start();
+    }
+
+    window.addEventListener('click', () => {
+      initAudio();
+      if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+    });
+
+    // ドラム音
+    function playKick() {
+      if (!audioCtx) return;
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.frequency.setValueAtTime(150, audioCtx.currentTime);
+      osc.frequency.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.3);
+      gain.gain.setValueAtTime(1, audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.3);
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.start();
+      osc.stop(audioCtx.currentTime + 0.3);
+      triggerFlash("#FF303033");
+    }
+
+    function playSnare() {
+      if (!audioCtx) return;
+      const bufferSize = audioCtx.sampleRate * 0.15;
+      const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+      const data = buffer.getChannelData(0);
+      for (let i = 0; i < bufferSize; i++) data[i] = Math.random() * 2 - 1;
+      const noise = audioCtx.createBufferSource();
+      noise.buffer = buffer;
+      const gain = audioCtx.createGain();
+      gain.gain.setValueAtTime(0.7, audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.15);
+      noise.connect(gain);
+      gain.connect(audioCtx.destination);
+      noise.start();
+      triggerFlash("#30FF3033");
+    }
+
+    function triggerFlash(color) {
+      flashLayer.style.backgroundColor = color;
+      flashLayer.style.opacity = "1";
+      setTimeout(() => { flashLayer.style.opacity = "0"; }, 100);
+    }
+
+    // ==========================================
+    // 2. MediaPipe の初期化
+    // ==========================================
+    async function initMediaPipe() {
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+      );
+      
+      faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+          delegate: "GPU"
+        },
+        runningMode: "VIDEO",
+        numFaces: 1
+      });
+
+      startCamera();
+    }
+
+    function startCamera() {
+      navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480, facingMode: "user" } })
+        .then((stream) => { video.srcObject = stream; });
+    }
+
+    let leftEyeClosed = false;
+    let rightEyeClosed = false;
+
+    // AIの推論ループ
+    async function predictWebcam() {
+      if (!faceLandmarker || !video.srcObject) return;
+
+      canvas.width = video.videoWidth || 640;
+      canvas.height = video.videoHeight || 480;
+      const drawingUtils = new DrawingUtils(ctx);
+
+      if (lastVideoTime !== video.currentTime) {
+        lastVideoTime = video.currentTime;
+        const results = faceLandmarker.detectForVideo(video, performance.now());
+        
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        if (results.faceLandmarks && results.faceLandmarks.length > 0) {
+          // ★ 追加：顔のランドマーク（線）を描画する
+          for (const landmarks of results.faceLandmarks) {
+            // 顔全体のメッシュ（薄いグレー）
+            drawingUtils.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_TESSELATION, { color: "#C0C0C070", lineWidth: 1 });
+            // 口の形（開発用に赤く太く強調）
+            drawingUtils.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_LIPS, { color: "#FF3030", lineWidth: 3 });
+            // 右目と左目（まばたき確認用）
+            drawingUtils.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_LEFT_EYE, { color: "#30FF30", lineWidth: 2 });
+            drawingUtils.drawConnectors(landmarks, FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE, { color: "#30FF30", lineWidth: 2 });
+          }
+
+          const landmarks = results.faceLandmarks[0];
+
+          // --- テルミンの制御 ---
+          const nose = landmarks[1];
+          const upperLip = landmarks[13];
+          const lowerLip = landmarks[14];
+          const leftMouth = landmarks[61];
+          const rightMouth = landmarks[291];
+
+          // ピッチ：顔の「左右（X座標）」に連動（左に行くと低音、右に行くと高音）
+          const faceX = Math.min(Math.max(nose.x, 0.2), 0.8);
+          const frequency = 800 - ((faceX - 0.2) / 0.6) * 600;
+
+          // 音量：口の縦の開き
+          const mouthDistY = Math.abs(upperLip.y - lowerLip.y) * canvas.height;
+          const volume = Math.min(Math.max((mouthDistY - 10) / 30, 0), 0.8);
+
+          // フィルター：口の横の広がり（「うー」でこもる、「いー」で明るい）
+          const mouthDistX = Math.abs(rightMouth.x - leftMouth.x) * canvas.width;
+          let filterFreq = ((mouthDistX - 30) / 70) * 700 + 300;
+          filterFreq = Math.min(Math.max(filterFreq, 300), 3000);
+
+          if (audioCtx && thereminOsc) {
+            thereminOsc.frequency.setTargetAtTime(frequency, audioCtx.currentTime, 0.05);
+            thereminGain.gain.setTargetAtTime(volume, audioCtx.currentTime, 0.05);
+            thereminFilter.frequency.setTargetAtTime(filterFreq, audioCtx.currentTime, 0.05);
+          }
+
+          document.getElementById("pitchInfo").innerText = `🎼 周波数: ${Math.round(frequency)} Hz`;
+          document.getElementById("volInfo").innerText = `🔊 音量: ${Math.round(volume * 100)} %`;
+
+          // --- まばたきドラムの制御 ---
+          const leftEyeDist = Math.abs(landmarks[386].y - landmarks[374].y) * canvas.height;
+          const rightEyeDist = Math.abs(landmarks[159].y - landmarks[145].y) * canvas.height;
+
+          const isLeftClosed = leftEyeDist < 5;
+          const isRightClosed = rightEyeDist < 5;
+
+          if (isLeftClosed && !leftEyeClosed) {
+            playKick();
+            leftEyeClosed = true;
+            document.getElementById("drumInfo").innerText = "🥁 ドラム: KICK 💥";
+          } else if (!isLeftClosed) leftEyeClosed = false;
+
+          if (isRightClosed && !rightEyeClosed) {
+            playSnare();
+            rightEyeClosed = true;
+            document.getElementById("drumInfo").innerText = "🥁 ドラム: SNARE ✨";
+          } else if (!isRightClosed) rightEyeClosed = false;
+
+          if (!isLeftClosed && !isRightClosed) {
+            document.getElementById("drumInfo").innerText = "🥁 ドラム: 待機中";
+          }
+        }
+      }
+    }
+
+    // ==========================================
+    // 3. 裏タブでも動かすための Web Worker タイマー
+    // ==========================================
+    const workerCode = `
+      // ブラウザの仕様を無視して、33ミリ秒（約30FPS）ごとにメインプログラムを叩き起こす
+      setInterval(() => { postMessage('tick'); }, 33);
+    `;
+    const timerWorker = new Worker(URL.createObjectURL(new Blob([workerCode], { type: 'application/javascript' })));
+
+    // 裏方から合図（tick）が来るたびに、推論（predictWebcam）を実行
+    timerWorker.onmessage = () => {
+      predictWebcam();
+    };
+
+    // 起動
+    initMediaPipe();
+  </script>
+</body>
+</html>
